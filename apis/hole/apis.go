@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"time"
+	"treehole_next/apis/message"
 	"treehole_next/config"
 	"treehole_next/utils/sensitive"
 
@@ -826,28 +827,42 @@ func HideHole(c *fiber.Ctx) error {
 	}
 
 	var hole Hole
-	hole.ID = holeID
-	result := DB.Model(&hole).Select("Hidden").Omit("UpdatedAt").Updates(Hole{Hidden: true})
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Take(&hole, holeID).Error
+		if err != nil {
+			return err
+		}
+
+		result := tx.Model(&hole).Select("Hidden").Omit("UpdatedAt").Updates(Hole{Hidden: true})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+
+		err = message.DeleteMessageByHoleID(tx, hole.ID)
+		if err != nil {
+			return err
+		}
+
+		hole.Hidden = true
+		CreateAdminLog(tx, AdminLogTypeHideHole, user.ID, struct {
+			HoleID int  `json:"hole_id"`
+			Hidden bool `json:"hidden"`
+		}{
+			HoleID: holeID,
+			Hidden: true,
+		})
+
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// log
 	MyLog("Hole", "Hide", holeID, user.ID, RoleAdmin)
-	CreateAdminLog(DB, AdminLogTypeHideHole, user.ID, struct {
-		HoleID int  `json:"hole_id"`
-		Hidden bool `json:"hidden"`
-	}{
-		HoleID: holeID,
-		Hidden: true,
-	})
-
-	// find hole and update cache
-
-	err = DB.Take(&hole).Error
-	if err != nil {
-		return err
-	}
 
 	updateHoles := Holes{&hole}
 	err = UpdateHoleCache(updateHoles)
@@ -922,12 +937,19 @@ func DeleteHole(c *fiber.Ctx) error {
 		return common.Forbidden()
 	}
 
-	result := DB.Delete(&hole)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Delete(&hole)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+
+		return message.DeleteMessageByHoleID(tx, hole.ID)
+	})
+	if err != nil {
+		return err
 	}
 
 	MyLog("Hole", "Delete", holeID, user.ID, userType)
